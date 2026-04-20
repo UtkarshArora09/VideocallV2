@@ -1,6 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
 import * as bodySegmentation from '@tensorflow-models/body-segmentation';
-import '@mediapipe/selfie_segmentation';
 
 let segmenter = null;
 

@@ -8,6 +8,11 @@ export default defineConfig({
     outDir: '../dist',
     emptyOutDir: true,
   },
+  resolve: {
+    alias: {
+      '@mediapipe/selfie_segmentation': '/utils/mock-mediapipe.js'
+    }
+  },
   server: {
     proxy: {
       '/api': {
