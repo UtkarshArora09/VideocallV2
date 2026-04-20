@@ -1,97 +1,167 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const { AccessToken } = require('livekit-server-sdk');
+const Anthropic = require('@anthropic-ai/sdk');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, { cors: { origin: '*' } });
 
-app.use(express.static('public'));
+app.use(express.json());
 
-let queue = []; // Array of { socketId, patientId }
-let doctorSocket = null;
-let durations = []; // call durations in minutes
-let patientStartTimes = {};
-let currentCallPatientId = null;
+// In-memory room state for Waitlist / Host approval
+// rooms = { [roomId]: { hostId, waitingList: [], participants: [] } }
+const rooms = {};
+
+// Optional: Initialize Anthropic if key exists
+const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
+  socket.on('room:join', ({ roomId, userName, isDoctor }) => {
+    socket.join(roomId);
 
-  socket.on('join-queue', (patientId) => {
-    queue.push({ socketId: socket.id, patientId });
-    console.log(`Patient ${patientId} joined the queue`);
-    sendQueueUpdates(); // update wait time for all
-  });
-
-  socket.on('register-doctor', () => {
-    doctorSocket = socket;
-    console.log('Doctor registered:', socket.id);
-  });
-
-  socket.on('call-next', () => {
-    if (!doctorSocket || queue.length === 0) return;
-
-    const nextPatient = queue.shift();
-    patientStartTimes[nextPatient.socketId] = Date.now();
-    currentCallPatientId = nextPatient.socketId;
-
-    doctorSocket.emit('calling-patient', {
-      patientId: nextPatient.patientId,
-      socketId: nextPatient.socketId
-    });
-
-    io.to(nextPatient.socketId).emit('join-call', {
-      doctorSocketId: doctorSocket.id
-    });
-
-    sendQueueUpdates(); // update remaining patients
-  });
-
-  socket.on('end_call', () => {
-    const start = patientStartTimes[socket.id];
-    if (start) {
-      const duration = (Date.now() - start) / 60000;
-      durations.push(duration);
-      console.log(`Call duration: ${duration.toFixed(2)} mins`);
-      delete patientStartTimes[socket.id];
+    if (!rooms[roomId]) {
+      rooms[roomId] = { hostId: null, hostName: null, waitingList: [], participants: [] };
     }
 
-    if (socket.id === currentCallPatientId) {
-      currentCallPatientId = null;
-    }
+    const room = rooms[roomId];
 
-    sendQueueUpdates();
+    if (isDoctor) {
+      // Doctor overwrites host state, even if patient joined first
+      room.hostId = socket.id;
+      room.hostName = userName;
+      socket.emit('room:status', { isHost: true });
+      socket.emit('room:admitted'); // Host is auto-admitted
+    } else {
+      socket.emit('room:status', { isHost: false });
+    }
   });
 
-  socket.on('signal', ({ to, signal }) => {
-    io.to(to).emit('signal', { from: socket.id, signal });
+  socket.on('room:knock', ({ roomId, name }) => {
+    const room = rooms[roomId];
+    if (room && room.hostId) {
+      const peer = { socketId: socket.id, name };
+      room.waitingList.push(peer);
+      socket.emit('room:waiting');
+      io.to(room.hostId).emit('room:knock-request', peer);
+    }
+  });
+
+  socket.on('room:admit', ({ roomId, peerId }) => {
+    const room = rooms[roomId];
+    if (room && room.hostId === socket.id) {
+      room.waitingList = room.waitingList.filter(p => p.socketId !== peerId);
+      room.participants.push(peerId);
+      io.to(peerId).emit('room:admitted');
+    }
+  });
+
+  socket.on('room:reject', ({ roomId, peerId }) => {
+    const room = rooms[roomId];
+    if (room && room.hostId === socket.id) {
+      room.waitingList = room.waitingList.filter(p => p.socketId !== peerId);
+      io.to(peerId).emit('room:rejected');
+    }
+  });
+
+  socket.on('room:kick', ({ roomId, peerId }) => {
+     const room = rooms[roomId];
+     if (room && room.hostId === socket.id) {
+        room.participants = room.participants.filter(p => p !== peerId);
+        io.to(peerId).emit('room:rejected');
+     }
+  });
+
+  socket.on('chat:message', ({ roomId, message, senderName, timestamp, senderId }) => {
+     io.to(roomId).emit('chat:message', { message, senderName, timestamp, senderId });
+  });
+
+  socket.on('peer:mediaState', ({ roomId, isMicOn, isVideoOn }) => {
+     io.to(roomId).emit('peer:mediaState', { peerId: socket.id, isMicOn, isVideoOn });
   });
 
   socket.on('disconnect', () => {
-    queue = queue.filter(p => p.socketId !== socket.id);
-    delete patientStartTimes[socket.id];
-    if (socket === doctorSocket) doctorSocket = null;
-    if (socket.id === currentCallPatientId) currentCallPatientId = null;
-    console.log('Disconnected:', socket.id);
-    sendQueueUpdates();
+    // Cleanup if host disconnects or user leaves
+    for (const [roomId, room] of Object.entries(rooms)) {
+      if (room.hostId === socket.id) {
+         // Optionally assign new host or destroy room
+         delete rooms[roomId];
+      } else {
+         room.waitingList = room.waitingList.filter(p => p.socketId !== socket.id);
+         room.participants = room.participants.filter(p => p !== socket.id);
+      }
+    }
   });
 });
 
-// Util: Broadcast wait time to patients based on their queue position
-function sendQueueUpdates() {
-  const avg = durations.length > 0
-    ? durations.reduce((a, b) => a + b, 0) / durations.length
-    : 5;
+app.post('/api/livekit/token', async (req, res) => {
+  const { roomId, participantName } = req.body;
+  if (!roomId || !participantName) {
+    return res.status(400).json({ error: 'Missing room or participant' });
+  }
 
-  queue.forEach((patient, index) => {
-    const estimatedTime = (index + 1) * avg;
-
-    // Don't send wait time to patient in call
-    if (patient.socketId !== currentCallPatientId) {
-      io.to(patient.socketId).emit('update_wait_time', estimatedTime);
-    }
+  const at = new AccessToken(process.env.LIVEKIT_API_KEY || 'devkey', process.env.LIVEKIT_API_SECRET || 'devsecret', {
+    identity: participantName + '-' + Math.floor(Math.random()*1000),
+    name: participantName,
   });
-}
+
+  at.addGrant({ roomJoin: true, room: roomId });
+  
+  try {
+     const token = await at.toJwt();
+     res.json({ token });
+  } catch(e) {
+     res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/summarize', async (req, res) => {
+  const { notes, patientName, doctorName, duration, date } = req.body;
+
+  if (!anthropic) {
+    return res.json({
+      summary: {
+        chiefComplaint: "MOCK AI DATA: Missing ANTHROPIC_API_KEY",
+        observations: notes,
+        recommendations: "Drink water",
+        followUp: "1 week",
+        disclaimer: "Mock mode enabled because Anthropic API key is missing."
+      }
+    });
+  }
+
+  try {
+    const prompt = `You are a medical note summarizer for Ayurvedic consultations. 
+    Given raw doctor notes from a telemedicine session, output a structured JSON with fields: chiefComplaint, observations, recommendations, followUp, duration, disclaimer.
+    Notes: ${notes}
+    Doctor: ${doctorName}
+    Duration: ${duration}s`;
+
+    const response = await anthropic.messages.create({
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1000,
+      temperature: 0.2,
+      system: "Output exactly valid JSON only, no markdown markdown formatting.",
+      messages: [{ role: "user", content: prompt }]
+    });
+
+    const outputText = response.content[0].text;
+    res.json({ summary: JSON.parse(outputText) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to generate summary' });
+  }
+});
+
+// Since client is built with Vite, Express can serve the dist folder in production
+// But it will primarily be backend API for local dev.
+app.use(express.static(path.join(__dirname, 'dist')));
+app.get('*', (req, res) => {
+   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
 
 server.listen(3000, () => {
   console.log('✅ Server running at http://localhost:3000');
